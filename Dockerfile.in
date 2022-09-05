@@ -1,0 +1,3 @@
+FROM scratch
+ADD @@TARBALL@@ /
+CMD ["bash"]
