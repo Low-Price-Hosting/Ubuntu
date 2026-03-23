@@ -1,0 +1,144 @@
+# vi: ts=4 expandtab syntax=sh
+
+clean_debian_chroot() {
+    # remove crufty files that shouldn't be left in an image
+    rm -f chroot/var/cache/debconf/*-old chroot/var/lib/dpkg/*-old
+    chroot chroot apt clean
+    # For the docker images we remove even more stuff.
+    if [ "${PROJECT}:${SUBPROJECT:-}" = "ubuntu-base:minimized" ] || [ "${PROJECT}:${SUBPROJECT:-}" = "ubuntu-oci:minimized" ]; then
+        # Remove apt lists (that are currently removed downstream
+        # anyway)
+        rm -rf chroot/var/lib/apt/lists/*
+        # Having device nodes in the docker image can cause problems
+        # (https://github.com/tianon/docker-brew-ubuntu-core/issues/62)
+        # so remove them.  We only do this for docker out of an
+        # abundance of caution.
+        rm -rf chroot/dev/*
+    fi
+}
+
+configure_universe() {
+    cat > chroot/etc/apt/sources.list << EOF
+# Ubuntu sources have moved to the /etc/apt/sources.list.d/ubuntu.sources
+# file, which uses the deb822 format. Use deb822-formatted .sources files
+# to manage package sources in the /etc/apt/sources.list.d/ directory.
+# See the sources.list(5) manual page for details.
+EOF
+
+    cat > chroot/etc/apt/sources.list.d/ubuntu.sources << EOF
+# See http://help.ubuntu.com/community/UpgradeNotes for how to upgrade to
+# newer versions of the distribution.
+
+## Ubuntu distribution repository
+##
+## The following settings can be adjusted to configure which packages to use from Ubuntu.
+## Mirror your choices (except for URIs and Suites) in the security section below to
+## ensure timely security updates.
+##
+## Types: Append deb-src to enable the fetching of source package.
+## URIs: A URL to the repository (you may add multiple URLs)
+## Suites: The following additional suites can be configured
+##   <name>-updates   - Major bug fix updates produced after the final release of the
+##                      distribution.
+##   <name>-backports - software from this repository may not have been tested as
+##                      extensively as that contained in the main release, although it includes
+##                      newer versions of some applications which may provide useful features.
+##                      Also, please note that software in backports WILL NOT receive any review
+##                      or updates from the Ubuntu security team.
+## Components: Aside from main, the following components can be added to the list
+##   restricted  - Software that may not be under a free license, or protected by patents.
+##   universe    - Community maintained packages. Software in this repository receives maintenance
+##                 from volunteers in the Ubuntu community, or a 10 year security maintenance
+##                 commitment from Canonical when an Ubuntu Pro subscription is attached.
+##   multiverse  - Community maintained of restricted. Software from this repository is
+##                 ENTIRELY UNSUPPORTED by the Ubuntu team, and may not be under a free
+##                 licence. Please satisfy yourself as to your rights to use the software.
+##                 Also, please note that software in multiverse WILL NOT receive any
+##                 review or updates from the Ubuntu security team.
+##
+## See the sources.list(5) manual page for further settings.
+Types: deb
+URIs: $LB_PARENT_MIRROR_BINARY
+Suites: $LB_DISTRIBUTION $LB_DISTRIBUTION-updates $LB_DISTRIBUTION-backports
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+## Ubuntu security updates. Aside from URIs and Suites,
+## this should mirror your choices in the previous section.
+Types: deb
+URIs: $LB_PARENT_MIRROR_BINARY_SECURITY
+Suites: $LB_DISTRIBUTION-security
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+
+}
+
+configure_oci() {
+    # configure a chroot to be a OCI/docker container
+    # theses changes are taken from the current Dockerfile modifications done
+    # at https://github.com/tianon/docker-brew-ubuntu-core/blob/master/update.sh
+
+    local chroot=$1
+
+    if [ ! -d "${chroot}" ]; then
+        echo "The chroot does not exist"
+        exit 1
+    fi
+
+    echo "==== Configuring OCI ===="
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L40-L48
+    echo '#!/bin/sh' > ${chroot}/usr/sbin/policy-rc.d
+    echo 'exit 101' >> ${chroot}/usr/sbin/policy-rc.d
+    chroot ${chroot} chmod +x /usr/sbin/policy-rc.d
+
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L54-L56
+    chroot ${chroot} dpkg-divert --local --rename --add /sbin/initctl
+    cp -a ${chroot}/usr/sbin/policy-rc.d ${chroot}/sbin/initctl
+    sed -i 's/^exit.*/exit 0/' ${chroot}/sbin/initctl
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L71-L78
+    echo 'force-unsafe-io' > ${chroot}/etc/dpkg/dpkg.cfg.d/docker-apt-speedup
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L85-L105
+    echo 'DPkg::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };' > ${chroot}/etc/apt/apt.conf.d/docker-clean
+
+    echo 'APT::Update::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };' >> ${chroot}/etc/apt/apt.conf.d/docker-clean
+
+    echo 'Dir::Cache::pkgcache ""; Dir::Cache::srcpkgcache "";' >> ${chroot}/etc/apt/apt.conf.d/docker-clean
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L109-L115
+    echo 'Acquire::Languages "none";' > ${chroot}/etc/apt/apt.conf.d/docker-no-languages
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L118-L130
+    echo 'Acquire::GzipIndexes "true"; Acquire::CompressionTypes::Order:: "gz";' > ${chroot}/etc/apt/apt.conf.d/docker-gzip-indexes
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L134-L151
+    echo 'Apt::AutoRemove::SuggestsImportant "false";' > ${chroot}/etc/apt/apt.conf.d/docker-autoremove-suggests
+
+    # https://bugs.launchpad.net/cloud-images/+bug/1810451
+    echo 'APT::Periodic::Enable "0";' > ${chroot}/etc/apt/apt.conf.d/docker-disable-periodic-update
+
+    # delete all the apt list files since they're big and get stale quickly
+    rm -rf ${chroot}/var/lib/apt/lists/*
+
+    # verify that the APT lists files do not exist
+    chroot chroot apt-get indextargets > indextargets.out
+    [ ! -s indextargets.out ]
+    rm indextargets.out
+    # (see https://bugs.launchpad.net/cloud-images/+bug/1699913)
+
+    # make systemd-detect-virt return "docker"
+    # See: https://github.com/systemd/systemd/blob/aa0c34279ee40bce2f9681b496922dedbadfca19/src/basic/virt.c#L434
+    mkdir -p ${chroot}/run/systemd
+    echo 'docker' > ${chroot}/run/systemd/container
+
+    # Create Ubuntu user
+    chroot ${chroot} useradd ubuntu -U -u 1000 --comment Ubuntu --groups adm,audio,cdrom,dialout,dip,floppy,plugdev,sudo,video --shell /bin/bash -m
+    rm -rf ${chroot}/var/cache/apt/*.bin
+
+    echo "==== Configuring OCI done ===="
+}
+

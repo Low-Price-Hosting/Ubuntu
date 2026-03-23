@@ -1,5 +1,8 @@
+# vi: ts=4 expandtab
 name: ubuntu
 version: "__RELEASE__"
+base: bare
+build-base: __BUILD_BASE__
 summary: The Ubuntu container image maintained by Canonical
 description: |
   Ubuntu is a Debian-based Linux operating system that runs from the desktop to the cloud, to all your internet connected things.
@@ -7,28 +10,137 @@ description: |
   It is the number one platform for containers; from Docker to Kubernetes to LXD, Ubuntu can run your containers at scale.
   Fast, secure and simple, Ubuntu powers millions of PCs worldwide.
 
-build-base: __BUILD_BASE__
-base: bare
 platforms:
-  amd64:
-  arm64:
-  armhf:
-  ppc64el:
-  riscv64:
-  s390x:
+    amd64:
+    arm64:
+    armhf:
+    ppc64el:
+    riscv64:
+    s390x:
 
 entrypoint-command: '[ /bin/bash ]'
 
 parts:
-  chroot:
-    plugin: nil
-    source: https://git.launchpad.net/cloud-images/+oci/ubuntu-base
-    source-type: git
-    source-branch: __SUITE__-__RELEASE__
-    source-depth: 1
-    override-build: |
-      mkdir chroot
-      pushd chroot
-      tar -xf ../ubuntu-__SUITE__-oci-${CRAFT_ARCH_BUILD_FOR}-root.tar.gz
-      popd
-      mv chroot/* ${CRAFT_PART_INSTALL}
+    chroot:
+        source: ./rockcraft-source
+        source-type: local
+        build-packages:
+            - debootstrap
+            - python3-apt
+        build-environment:
+            - PROJECT: "ubuntu-oci"
+            - SUBPROJECT: "minimized"
+            - LB_DISTRIBUTION: __SUITE__
+            - SERIAL: __SERIAL__
+            - X86_LB_PARENT_MIRROR_BINARY: "http://archive.ubuntu.com/ubuntu/"
+            - X86_LB_PARENT_MIRROR_BINARY_SECURITY: "http://security.ubuntu.com/ubuntu/"
+            - PORT_LB_PARENT_MIRROR_BINARY: "http://ports.ubuntu.com/ubuntu-ports/"
+            - PORT_LB_PARENT_MIRROR_BINARY_SECURITY: "http://ports.ubuntu.com/ubuntu-ports/"
+        plugin: nil
+        override-build: |
+            # Prepare the environmental variables for configure_universe
+            case "${CRAFT_ARCH_BUILD_FOR}" in
+              amd64|i386)
+                export LB_PARENT_MIRROR_BINARY="${X86_LB_PARENT_MIRROR_BINARY}"
+                export LB_PARENT_MIRROR_BINARY_SECURITY="${X86_LB_PARENT_MIRROR_BINARY_SECURITY}"
+              ;;
+              *)
+                export LB_PARENT_MIRROR_BINARY="${PORT_LB_PARENT_MIRROR_BINARY}"
+                export LB_PARENT_MIRROR_BINARY_SECURITY="${PORT_LB_PARENT_MIRROR_BINARY_SECURITY}"
+              ;;
+            esac
+
+            # The following script references the `live-build/auto/build` script in package `livecd-rootfs`
+            mkdir chroot
+            debootstrap --arch=${CRAFT_ARCH_BUILD_FOR} --components=main,restricted --variant=minbase ${LB_DISTRIBUTION} chroot
+            . ./scripts/functions
+
+            echo "LANG=C.UTF-8" > chroot/etc/default/locale
+            # livecd-rootfs/live-build/auto/build:L156-159
+            if ! chroot chroot dpkg -l tzdata 2>&1 |grep -q ^ii; then
+               # workaround for tzdata purge not removing these files
+               rm -f chroot/etc/localtime chroot/etc/timezone
+            fi
+            # set up dpkg filters to skip installing docs on minimized system
+            # livecd-rootfs/live-build/auto/build:L167-183
+            mkdir -p chroot/etc/dpkg/dpkg.cfg.d
+            cp ./includes.chroot/etc/dpkg/dpkg.cfg.d/excludes chroot/etc/dpkg/dpkg.cfg.d/excludes
+
+            # livecd-rootfs/live-build/auto/build:L186
+            # Remove docs installed by bootstrap
+            chroot chroot dpkg-query -f '${binary:Package}\n' -W | chroot chroot xargs -L1 apt-get install --reinstall
+
+            # livecd-rootfs/live-build/auto/build:L190-200
+            # inform users about the unminimize script
+            cp ./includes.chroot/etc/update-motd.d/60-unminimize chroot/etc/update-motd.d/60-unminimize
+
+            # livecd-rootfs/live-build/auto/build:L203-205
+            chroot chroot dpkg-divert --quiet --add \
+                        --divert /usr/bin/man.REAL --rename \
+                        /usr/bin/man
+
+            # livecd-rootfs/live-build/auto/build:L206-214
+            cp ./includes.chroot/usr/bin/man chroot/usr/bin/man
+
+            # livecd-rootfs/live-build/auto/build:L274
+            configure_universe
+
+            # This code block is adapted from the `scripts/build/chroot_archives` in package `live-build` on branch `master`
+            # livecd-rootfs/live-build/auto/build:L300-302
+            chroot chroot apt-get --yes -oDebug::pkgDepCache::AutoInstall=yes --no-install-recommends update
+            chroot chroot apt-get --yes -oDebug::pkgDepCache::AutoInstall=yes --no-install-recommends --force-yes upgrade
+            chroot chroot apt-get --yes -oDebug::pkgDepCache::AutoInstall=yes --no-install-recommends --force-yes dist-upgrade
+            # livecd-rootfs/live-build/auto/config:L1110-1111
+            # chroot chroot apt-get --yes -oDebug::pkgDepCache::AutoInstall=yes --no-install-recommends install unminimize
+
+            # livecd-rootfs/live-build/auto/build:L237-241
+            if [ -d chroot/etc/apt/preferences.d.save ]; then
+              # https://mastodon.social/@scream@botsin.space
+              mv chroot/etc/apt/preferences.d.save/* chroot/etc/apt/preferences.d/
+              rmdir chroot/etc/apt/preferences.d.save
+            fi
+
+            # livecd-rootfs/live-build/auto/build:L257-264
+            chroot chroot env DEBIAN_FRONTEND=noninteractive \
+              apt-get -y purge initramfs-tools busybox-initramfs landscape-common
+            rm -f chroot/boot/initrd.img-*
+
+            # livecd-rootfs/live-build/auto/build:L268-271
+            chroot chroot env DEBIAN_FRONTEND=noninteractive \
+                                apt-mark manual linux-base
+            chroot chroot env DEBIAN_FRONTEND=noninteractive \
+                                apt-get -y --purge autoremove
+
+            # livecd-rootfs/live-build/auto/build:L363-375
+            if [ -n "$SERIAL" ]; then
+              mkdir -p chroot/etc/cloud
+              cat > chroot/etc/cloud/build.info << EOF
+            build_name: $PROJECT:${SUBPROJECT:-}
+            serial: $SERIAL
+            EOF
+            else
+              echo "The \$BUILDSTAMP variable is empty"
+              exit 1
+            fi
+            configure_oci chroot
+
+            # livecd-rootfs/live-build/auto/build:L380-383
+            echo "===== Checking size of /usr/share/doc ====="
+            echo BEGIN docdirs
+            (cd chroot && find usr/share/doc -maxdepth 1 -type d | xargs du -s | sort -nr)
+            echo END docdirs
+
+            # livecd-rootfs/live-build/auto/build:L385
+            pushd ./scripts
+            ./minimize-manual ../chroot
+            popd
+
+            # livecd-rootfs/live-build/auto/build:L387
+            clean_debian_chroot
+
+            rm -f chroot/etc/resolv.conf
+            touch chroot/etc/resolv.conf
+
+            rm -f chroot/var/log/apt/term.log
+
+            mv chroot/* "$CRAFT_PART_INSTALL"

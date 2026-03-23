@@ -1,11 +1,15 @@
 # This target generates rockcraft.yaml from rockcraft.yaml.template by replacing
-# the placeholders __BUILD_BASE__, __RELEASE__, and __SUITE__.
+# the placeholders __BUILD_BASE__, __RELEASE__, __SERIAL__, and __SUITE__.
 # It determines the __BUILD_BASE__ by checking if the specified RELEASE is
 # already supported in Rockcraft schema as a build-base. If not, it uses "devel"
 # as the __BUILD_BASE__.
 rockcraft.yaml:
 	@if [ -z "$(RELEASE)" ] || [ -z "$(SUITE)" ]; then \
 		echo "Error: RELEASE and SUITE environment variables must be set"; \
+		exit 1; \
+	fi; \
+        if [ -z "$(SERIAL)" ]; then \
+		echo "Error: SERIAL environment variable must be set"; \
 		exit 1; \
 	fi; \
 	JQ_QUERY='.properties.["build-base"].anyOf[0].enum | contains(["ubuntu@$(RELEASE)"])' ;\
@@ -17,6 +21,7 @@ rockcraft.yaml:
 	fi; \
 	sed -e "s/__RELEASE__/$(RELEASE)/g" \
 		-e "s/__SUITE__/$(SUITE)/g" \
+		-e "s/__SERIAL__/$(SERIAL)/g" \
 		-e "s/__BUILD_BASE__/$$BUILD_BASE/g" \
 		rockcraft.yaml.template > rockcraft.yaml
 
