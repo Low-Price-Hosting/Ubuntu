@@ -143,4 +143,9 @@ parts:
 
             rm -f chroot/var/log/apt/term.log
 
+            # align with the default hostname from live-build hooks
+            echo 'localhost.localdomain' > chroot/etc/hostname
+            touch chroot/etc/hosts
+            touch chroot/etc/machine-id
+
             mv chroot/* "$CRAFT_PART_INSTALL"
