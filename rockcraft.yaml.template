@@ -1,5 +1,5 @@
 name: ubuntu
-version: __RELEASE__
+version: "__RELEASE__"
 summary: The Ubuntu container image maintained by Canonical
 description: |
   Ubuntu is a Debian-based Linux operating system that runs from the desktop to the cloud, to all your internet connected things.
