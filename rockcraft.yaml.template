@@ -90,8 +90,6 @@ parts:
             chroot chroot apt-get --yes -oDebug::pkgDepCache::AutoInstall=yes --no-install-recommends update
             chroot chroot apt-get --yes -oDebug::pkgDepCache::AutoInstall=yes --no-install-recommends --force-yes upgrade
             chroot chroot apt-get --yes -oDebug::pkgDepCache::AutoInstall=yes --no-install-recommends --force-yes dist-upgrade
-            # livecd-rootfs/live-build/auto/config:L1110-1111
-            # chroot chroot apt-get --yes -oDebug::pkgDepCache::AutoInstall=yes --no-install-recommends install unminimize
 
             # livecd-rootfs/live-build/auto/build:L237-241
             if [ -d chroot/etc/apt/preferences.d.save ]; then
@@ -119,7 +117,7 @@ parts:
             serial: $SERIAL
             EOF
             else
-              echo "The \$BUILDSTAMP variable is empty"
+              echo "The \$SERIAL variable is empty"
               exit 1
             fi
             configure_oci chroot

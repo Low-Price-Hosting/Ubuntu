@@ -8,7 +8,7 @@ rockcraft.yaml:
 		echo "Error: RELEASE and SUITE environment variables must be set"; \
 		exit 1; \
 	fi; \
-        if [ -z "$(SERIAL)" ]; then \
+	if [ -z "$(SERIAL)" ]; then \
 		echo "Error: SERIAL environment variable must be set"; \
 		exit 1; \
 	fi; \
