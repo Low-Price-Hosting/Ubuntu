@@ -67,6 +67,8 @@ parts:
             cp ./includes.chroot/etc/dpkg/dpkg.cfg.d/excludes chroot/etc/dpkg/dpkg.cfg.d/excludes
 
             # livecd-rootfs/live-build/auto/build:L186
+            setup_mountpoint chroot
+
             # Remove docs installed by bootstrap
             chroot chroot dpkg-query -f '${binary:Package}\n' -W | chroot chroot xargs -L1 apt-get install --reinstall
 
@@ -109,6 +111,8 @@ parts:
             chroot chroot env DEBIAN_FRONTEND=noninteractive \
                                 apt-get -y --purge autoremove
 
+            teardown_mountpoint chroot
+
             # livecd-rootfs/live-build/auto/build:L363-375
             if [ -n "$SERIAL" ]; then
               mkdir -p chroot/etc/cloud
@@ -144,6 +148,6 @@ parts:
             # align with the default hostname from live-build hooks
             echo 'localhost.localdomain' > chroot/etc/hostname
             touch chroot/etc/hosts
-            touch chroot/etc/machine-id
+            : > chroot/etc/machine-id
 
             mv chroot/* "$CRAFT_PART_INSTALL"

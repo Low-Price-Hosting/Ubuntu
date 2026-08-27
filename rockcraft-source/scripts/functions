@@ -1,5 +1,27 @@
 # vi: ts=4 expandtab syntax=sh
 
+setup_mountpoint() {
+    local mountpoint="$1"
+
+    # Only mount the virtual filesystems needed by package maintainer scripts.
+    mount devpts-live -t devpts -o nodev,nosuid "$mountpoint/dev/pts"
+    mount proc-live -t proc "$mountpoint/proc"
+    mount sysfs-live -t sysfs "$mountpoint/sys"
+}
+
+teardown_mountpoint() {
+    local mountpoint=$(realpath "$1")
+
+    # Ensure we have exactly one trailing slash, and escape all slashes for awk.
+    mountpoint_match=$(echo "$mountpoint" | sed -e 's,/$,,; s,/,\\/,g;')'\/'
+    # sort -r ensures that deeper mountpoints are unmounted first
+    for submount in $(awk </proc/self/mounts "\$2 ~ /$mountpoint_match/ \
+                      { print \$2 }" | LC_ALL=C sort -r); do
+        mount --make-private $submount
+        umount $submount
+    done
+}
+
 clean_debian_chroot() {
     # remove crufty files that shouldn't be left in an image
     rm -f chroot/var/cache/debconf/*-old chroot/var/lib/dpkg/*-old
@@ -141,4 +163,3 @@ configure_oci() {
 
     echo "==== Configuring OCI done ===="
 }
-
