@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "distribution": "Ubuntu",
+  "upstream": "https://git.launchpad.net/livecd-rootfs",
+  "ref": "ubuntu/noble",
+  "revision": "f492363dc196a54b49af881b94e7a1e4f8a45f27"
+}

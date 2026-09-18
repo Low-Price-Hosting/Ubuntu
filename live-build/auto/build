@@ -1,0 +1,577 @@
+#! /bin/sh
+set -e
+
+export LC_ALL=C
+
+( . "${LIVE_BUILD}/scripts/build.sh" > /dev/null 2>&1 || true ) || . /usr/lib/live/build.sh
+
+Arguments "${@}"
+
+Read_conffiles config/all config/common config/bootstrap config/chroot config/binary config/source
+Set_defaults
+
+if [ -z "${PROJECT:-}" ]; then
+    echo "PROJECT environment variable has to be set" >&2
+    exit 1
+fi
+
+. config/functions
+
+# Link output files somewhere launchpad-buildd will be able to find them.
+PREFIX="livecd.$PROJECT${SUBARCH:+-$SUBARCH}"
+
+if [ "${IMAGEFORMAT:-}" = "ubuntu-image" ] \
+	|| [ "$PROJECT" = "ubuntu-core-desktop" ]; then
+	# Use ubuntu-image instead (or as part) of live-build
+
+	export SNAPPY_STORE_NO_CDN=1
+	LB_UBUNTU_IMAGE_CHANNEL="${LB_UBUNTU_IMAGE_CHANNEL:-stable}"
+	snap install \
+            --classic --channel="$LB_UBUNTU_IMAGE_CHANNEL" ubuntu-image
+
+	if [ "$PROJECT" = "ubuntu-core" ]; then
+		# Ubuntu Core images
+		/snap/bin/ubuntu-image snap $UBUNTU_IMAGE_ARGS \
+			-O output "$PREFIX".model-assertion
+		# XXX: currently we only have one image generated, but really
+		#  we should be supporting more than one for models that
+		#  define those.
+		mv output/*.img "$PREFIX".img
+		# For standard, non-platform-specific core images, prepare a
+		# qcow2 image as well for LXD consumption.
+		if [ -z "${SUBARCH:-}" ]; then
+			convert_to_qcow2 "$PREFIX".img "$PREFIX".qcow2
+		fi
+		xz -0 -T4 "$PREFIX".img
+		mv output/seed.manifest "$PREFIX".manifest
+
+		# All the builds are finished now, exit
+		exit 0
+	elif [ "$PROJECT" = "ubuntu-core-desktop" ]; then
+		# Ubuntu Core Desktop payload image
+		# Special case for ubuntu-core-desktop - we need to call
+		# ubuntu-image twice, once for the core image payload and
+		# then for the actual image.
+		echo "Building the core image payload"
+		cd config/
+		/snap/bin/ubuntu-image snap $UBUNTU_IMAGE_PAYLOAD_ARGS \
+			-O output ubuntu-core-desktop*.model-assertion
+		mv output/*.img pc.img
+		xz -0 -T4 pc.img
+		rm -rf output/
+
+		# Prepare the source catalogue
+		cat install-sources-in.yaml | sed "s/@SIZE@/$(stat -c%s pc.img.xz)/g" > ../"$PREFIX".install-sources.yaml
+
+		# We need to rename the image file so that it can be pulled
+		# by the builder.
+		mv pc.img.xz ../"$PREFIX".img.xz
+
+		# We need to make sure the autoinstall file is also exported.
+		mv autoinstall.yaml ../"$PREFIX".autoinstall.yaml
+
+		# Useful to have the model-assertion exported as well.
+		mv ubuntu-core-desktop*.model-assertion ../"$PREFIX".model-assertion
+
+		# Important: return to the previous directory
+		cd ../
+
+		# Payload build finished, but now we need to build the rest with the
+		# usual live-build tools.
+	else
+		# Ubuntu classic preinstalled images
+		/snap/bin/ubuntu-image classic --verbose $UBUNTU_IMAGE_ARGS \
+			-O output "$IMAGE_DEFINITION"
+		# Since the output of the ubuntu-image call can vary based on what
+		# kind of an image we build, the safest bet is to 'export' all the
+		# artifacts from the output directory. The image definition file
+		# should be what defines what is expected, so that we don't have
+		# to tweak livecd-rootfs everytime a different type of artifact
+		# is needed.
+		for artifact in output/*; do
+			# We want to be dynamic, and want to support even
+			# two-part extensions.
+			filename=$(basename $artifact)
+			noversion=$(echo $filename | sed 's/[0-9][0-9]\.[0-9][0-9]//')
+			extension=${noversion#*.}
+			mv $artifact "$PREFIX".$extension
+		done
+		[ -f $PREFIX.img ] && xz -0 -T4 "$PREFIX".img
+
+		# All the builds are finished now, exit
+		exit 0
+	fi
+fi
+
+# Setup cleanup function
+Setup_cleanup
+
+preinstall_snaps() {
+	setup_mountpoint chroot
+
+	snap_prepare chroot
+
+	for snap in "$@"; do
+		SNAP_NO_VALIDATE_SEED=1 snap_preseed chroot "${snap}"
+	done
+
+	snap_validate_seed chroot
+
+	teardown_mountpoint chroot
+}
+
+rm -f binary.success
+(
+	if [ -d config/gnupg ]; then
+		cat << @@EOF > config/gnupg/NEWKEY
+Key-Type: DSA
+Key-Length: 1024
+Key-Usage: sign
+Name-Real: Ubuntu Local Archive One-Time Signing Key
+Name-Email: cdimage@ubuntu.com
+Expire-Date: 0
+@@EOF
+		gpg --home config/gnupg --gen-key --batch < config/gnupg/NEWKEY \
+			> config/gnupg/generate.log 2>&1 &
+		GPG_PROCESS=$!
+	fi
+
+	ec=0
+	lb bootstrap "$@" || ec=$?
+	if [ $ec -ne 0 ] ; then
+		if [ ! -f chroot/debootstrap/debootstrap.log ] ; then
+			echo "debootstrap.log not found"
+			exit $ec
+		fi
+
+		echo "################# BEGIN debootstrap.log ################"
+		cat chroot/debootstrap/debootstrap.log
+		echo "################### END debootstrap.log ################"
+		exit $ec
+	fi
+
+	# Set locale to C.UTF-8 by default.  This may be overridden later.
+	echo "LANG=C.UTF-8" > chroot/etc/default/locale
+
+	if [ "${SUBPROJECT:-}" = minimized ] \
+	   && ! Chroot chroot dpkg -l tzdata 2>&1 |grep -q ^ii; then
+		# workaround for tzdata purge not removing these files
+		rm -f chroot/etc/localtime chroot/etc/timezone
+	fi
+
+	if [ "${SUBPROJECT:-}" = minimized ] || [ "${PROJECT}" = "ubuntu-server" ]; then
+		# ubuntu-server has a minimized base layer so needs
+		# minimizations applied to the chroot
+
+		# set up dpkg filters to skip installing docs on minimized system
+		mkdir -p chroot/etc/dpkg/dpkg.cfg.d
+		cat > chroot/etc/dpkg/dpkg.cfg.d/excludes <<EOF
+# Drop all man pages
+path-exclude=/usr/share/man/*
+
+# Drop all translations
+path-exclude=/usr/share/locale/*/LC_MESSAGES/*.mo
+
+# Drop all documentation ...
+path-exclude=/usr/share/doc/*
+
+# ... except copyright files ...
+path-include=/usr/share/doc/*/copyright
+
+# ... and Debian changelogs for native & non-native packages
+path-include=/usr/share/doc/*/changelog.*
+EOF
+
+		# Remove docs installed by bootstrap
+		Chroot chroot dpkg-query -f '${binary:Package}\n' -W | Chroot chroot xargs -L1 apt-get install --reinstall
+
+
+		# inform users about the unminimize script
+		cat > "chroot/etc/update-motd.d/60-unminimize" << EOF
+#!/bin/sh
+#
+# This file is not managed by a package.  If you no longer want to
+# see this message you can safely remove the file.
+echo ""
+echo "This system has been minimized by removing packages and content that are"
+echo "not required on a system that users do not log into."
+echo ""
+echo "To restore this content, you can run the 'unminimize' command."
+EOF
+
+		chmod +x chroot/etc/update-motd.d/60-unminimize
+		Chroot chroot "dpkg-divert --quiet --add \
+			--divert /usr/bin/man.REAL --rename \
+			/usr/bin/man"
+		cat > chroot/usr/bin/man << EOF
+#!/bin/sh
+echo "This system has been minimized by removing packages and content that are"
+echo "not required on a system that users do not log into."
+echo ""
+echo "To restore this content, including manpages, you can run the 'unminimize'"
+echo "command. You will still need to ensure the 'man-db' package is installed."
+EOF
+                chmod +x chroot/usr/bin/man
+	fi
+
+	if [ "${SUBPROJECT:-}" != minimized ] \
+	   && [ "${PROJECT}" != "ubuntu-server" ]
+	then
+		# debootstrap doesn't handle Recommends and fixing this is
+		# non-trivial, so install missing Recommends here
+		echo "Installing any missing recommends"
+		Chroot chroot "env DEBIAN_FRONTEND=noninteractive \
+			apt-get -y --fix-policy install"
+	fi
+
+	if [ -n "${PASSES}" ]; then
+		PATH="config/:$PATH" lb chroot_layered "$@"
+	else
+		divert_grub chroot
+		divert_update_initramfs
+		lb chroot "$@"
+		undivert_update_initramfs
+		undivert_grub chroot
+	fi
+
+	if [ -d chroot/etc/apt/preferences.d.save ]; then
+		# https://mastodon.social/@scream@botsin.space
+		mv chroot/etc/apt/preferences.d.save/* chroot/etc/apt/preferences.d/
+		rmdir chroot/etc/apt/preferences.d.save
+	fi
+
+	# Let all configuration non multi-layered project here.
+	# If those are moving to a multi-layer layout, this needs to be
+	# done in chroot hooks.
+	if [ -z "$PASSES" ]; then
+		if [ "${SUBPROJECT:-}" = minimized ]; then
+			# ubuntu-cpc has moved to using ubuntu-cloud-minimal seed
+			# for minimized images, so don't need these purges anymore.
+			if [ "$PROJECT" != ubuntu-cpc ]; then
+				# force removal of initramfs-tools, which we assert is not
+				# required for any minimized images but is still pulled in by
+				# default
+				# also remove landscape-common, which is heavyweight and
+				# in the server seed only to provide /etc/motd content which
+				# would only be seen by humans
+				Chroot chroot "env DEBIAN_FRONTEND=noninteractive \
+					apt-get -y purge initramfs-tools busybox-initramfs \
+						landscape-common"
+				# and if initramfs-tools was configured before our kernel,
+				# /etc/kernel/postinst.d/initramfs-tools will have created
+				# an initramfs despite the generic dpkg-divert; so remove it
+				# here.
+				rm -f chroot/boot/initrd.img-*
+			fi
+			# temporary workaround: don't remove linux-base which
+			# may have no other reverse-depends currently
+			Chroot chroot "env DEBIAN_FRONTEND=noninteractive \
+				apt-mark manual linux-base"
+			Chroot chroot "env DEBIAN_FRONTEND=noninteractive \
+				apt-get -y --purge autoremove"
+		fi
+
+		configure_universe
+
+		if [ -d chroot/var/lib/preinstalled-pool ]; then
+			cat > config/indices/apt.conf <<-EOF
+Dir {
+ ArchiveDir "chroot/var/lib/preinstalled-pool";
+ OverrideDir "config/indices";
+ CacheDir "config/indices";
+}
+Default { Packages::Compress ". bzip2"; }
+TreeDefault { Directory "pool"; }
+Tree "dists/$LB_DISTRIBUTION"
+{
+ Sections "$LB_PARENT_ARCHIVE_AREAS";
+ Architectures "$LB_ARCHITECTURES";
+ BinOverride "override.$LB_DISTRIBUTION.\$(SECTION)";
+ ExtraOverride "override.$LB_DISTRIBUTION.extra.\$(SECTION)";
+ Contents " ";
+}
+EOF
+			for component in $LB_PARENT_ARCHIVE_AREAS; do
+				mkdir -p chroot/var/lib/preinstalled-pool/dists/$LB_DISTRIBUTION/$component/binary-$LB_ARCHITECTURES
+			done
+			apt-ftparchive generate config/indices/apt.conf
+			cat << @@EOF > chroot/etc/apt/sources.list.d/preinstalled-pool.sources
+# This is a sources.list entry for a small pool of packages
+# provided on your preinstalled filesystem for your convenience.
+#
+# It is perfectly safe to delete both this entry and the directory
+# it references, should you want to save disk space and fetch the
+# packages remotely instead.
+#
+Types: deb
+URIs: file:/var/lib/preinstalled-pool/
+Suites: $LB_DISTRIBUTION
+Components: $LB_PARENT_ARCHIVE_AREAS
+Signed-By: /etc/apt/keyrings/preinstalled-pool.gpg
+@@EOF
+
+
+			echo "Waiting on gnupg ("$GPG_PROCESS") to finish generating a key."
+			wait $GPG_PROCESS
+
+			R_ORIGIN=$(lsb_release -i -s)
+			R_CODENAME=$(lsb_release -c -s)
+			R_VERSION=$(lsb_release -r -s)
+			R_PRETTYNAME=$(echo $R_CODENAME | sed -e 's/^\(.\)/\U\1/')
+
+			apt-ftparchive -o APT::FTPArchive::Release::Origin=$R_ORIGIN \
+				-o APT::FTPArchive::Release::Label=$R_ORIGIN \
+				-o APT::FTPArchive::Release::Suite=$R_CODENAME-local \
+				-o APT::FTPArchive::Release::Version=$R_VERSION \
+				-o APT::FTPArchive::Release::Codename=$R_CODENAME \
+				-o APT::FTPArchive::Release::Description="$R_ORIGIN $R_PRETTYNAME Local" \
+				release chroot/var/lib/preinstalled-pool/dists/$R_CODENAME/ \
+					> config/gnupg/Release
+
+			gpg --home config/gnupg --detach-sign --armor config/gnupg/Release
+			mv config/gnupg/Release \
+				chroot/var/lib/preinstalled-pool/dists/$R_CODENAME/Release
+			mv config/gnupg/Release.asc \
+				chroot/var/lib/preinstalled-pool/dists/$R_CODENAME/Release.gpg
+			cp config/gnupg/pubring.gpg chroot/etc/apt/keyrings/preinstalled-pool.gpg
+			find chroot/var/lib/preinstalled-pool/ -name Packages | xargs rm
+			# We only want to have a cache for the pre-installed pool at this point
+			Chroot chroot "apt-get update -o Dir::Etc::SourceParts=/dev/null -oDir::Etc::SourceList=etc/apt/sources.list.d/preinstalled-pool.sources"
+		fi
+		case $PROJECT:$SUBPROJECT in
+			*)
+				if [ -e "config/seeded-snaps" ]; then
+					snap_list=$(cat config/seeded-snaps)
+					preinstall_snaps $snap_list
+				fi
+				;;
+		esac
+
+		if [ "$PROJECT" = "ubuntu-cpc" ]; then
+			if [ "${SUBPROJECT:-}" = minimized ]; then
+				BUILD_NAME=minimal
+			else
+				BUILD_NAME=server
+			fi
+			cat > chroot/etc/cloud/build.info << EOF
+build_name: $BUILD_NAME
+serial: $BUILDSTAMP
+EOF
+		fi
+
+		if [ "${PROJECT}" = ubuntu-base ] || [ "${PROJECT}" = "ubuntu-oci" ]; then
+			if [ -n "$BUILDSTAMP" ]; then
+				mkdir -p chroot/etc/cloud
+				cat > chroot/etc/cloud/build.info << EOF
+build_name: $PROJECT:${SUBPROJECT:-}
+serial: $BUILDSTAMP
+EOF
+				if [ "${PROJECT}" = "ubuntu-oci" ]; then
+					configure_oci chroot
+				fi
+			else
+				echo "The \$BUILDSTAMP variable is empty"
+				exit 1
+			fi
+		fi
+
+		configure_network_manager
+
+		echo "===== Checking size of /usr/share/doc ====="
+		echo BEGIN docdirs
+		(cd chroot && find usr/share/doc -maxdepth 1 -type d | xargs du -s | sort -nr)
+		echo END docdirs
+
+		/usr/share/livecd-rootfs/minimize-manual chroot
+
+		clean_debian_chroot
+	fi
+
+	# XXX: Terrible last-minute hack to work-around issue LP: #2008082 !
+	#  This basically needs to be done better, we simply need to make sure
+	#  that we don't update the cache after lb cleans up. Since identifying
+	#  that might take a moment, for now, for flavors that are generally
+	#  affected by this, we manually clear out the archive-related Packages
+	#  files in the cache.
+	case $PROJECT in
+		ubuntu|xubuntu|kubuntu|ubuntu-budgie|ubuntukylin|ubuntu-mate|ubuntucinnamon|ubuntu-unity|edubuntu)
+			rm -f chroot/var/lib/apt/lists/*ubuntu.com*_Packages
+			;;
+	esac
+
+	if [ -n "${PASSES}" ]; then
+		PATH="config/:$PATH" lb binary_layered "$@"
+	else
+		lb binary "$@"
+	fi
+
+	touch binary.success
+) 2>&1 | tee binary.log
+
+# bash has trouble with the build.sh sourcing arrangement at the top of this
+# file, so we use this cheap-and-cheerful approach rather than the more
+# correct 'set -o pipefail'.
+if [ -e binary.success ]; then
+	rm -f binary.success
+else
+	exit 1
+fi
+
+case $LB_INITRAMFS in
+	casper)
+		INITFS="casper"
+		;;
+
+	live-boot)
+		INITFS="live"
+		;;
+
+	*)
+		INITFS="boot"
+		;;
+esac
+
+for OUTPUT in ext2 ext3 ext4 manifest manifest-remove size squashfs; do
+	[ -e "binary/$INITFS/filesystem.$OUTPUT" ] || continue
+	ln "binary/$INITFS/filesystem.$OUTPUT" "$PREFIX.$OUTPUT"
+	chmod 644 "$PREFIX.$OUTPUT"
+done
+
+# we don't need a manifest-remove for a layered-aware installer
+# here we have a list of all new-installer flavors
+case $PROJECT in
+	ubuntu|ubuntu-budgie)
+		rm -f livecd.${PROJECT}-manifest-remove
+		rm -f config/manifest-minimal-remove
+		;;
+esac
+
+if [ -e config/manifest-minimal-remove ]; then
+        cp config/manifest-minimal-remove  "$PREFIX.manifest-minimal-remove"
+fi
+
+for ISO in binary.iso binary.hybrid.iso; do
+	[ -e "$ISO" ] || continue
+	ln "$ISO" "$PREFIX.iso"
+	chmod 644 "$PREFIX.iso"
+	break
+done
+
+if [ -e "binary/$INITFS/filesystem.dir" ]; then
+	(cd "binary/$INITFS/filesystem.dir/" && tar -c --sort=name --xattrs *) | \
+		gzip -9 --rsyncable > "$PREFIX.rootfs.tar.gz"
+	chmod 644 "$PREFIX.rootfs.tar.gz"
+elif [ -e binary-tar.tar.gz ]; then
+	cp -a binary-tar.tar.gz "$PREFIX.rootfs.tar.gz"
+fi
+
+# '--initramfs none' produces different manifest names.
+if [ -e "binary/$INITFS/filesystem.packages" ]; then
+	ln "binary/$INITFS/filesystem.packages" "$PREFIX.manifest"
+	chmod 644 "$PREFIX.manifest"
+fi
+
+# If a .filelist is present, use it as the filelist for the image by
+# symlinking with expected name and updating permissions
+if [ -e "binary/$INITFS/filesystem.filelist" ]; then
+	ln "binary/$INITFS/filesystem.filelist" "$PREFIX.filelist"
+	chmod 644 "$PREFIX.filelist"
+fi
+
+if [ -e "binary/$INITFS/filesystem.packages-remove" ]; then
+	# Not a typo, empty manifest-remove has a single LF in it. :/
+	if [ $(cat binary/$INITFS/filesystem.packages-remove | wc -c) -gt 1 ]; then
+		ln "binary/$INITFS/filesystem.packages-remove" "$PREFIX.manifest-remove"
+		chmod 644 "$PREFIX.manifest-remove"
+	fi
+fi
+
+# Since snaps are now Ubuntu first-class citizen, so always try fetching the
+# list of seeded snaps into the manifest.  In case of layered images we skip
+# this step, as we assume they're doing it on their own at some earlier stage.
+if [ -z "$PASSES" ] && [ -e "$PREFIX.manifest" ]; then
+	./config/snap-seed-parse "chroot/" "$PREFIX.manifest"
+fi
+
+for FLAVOUR in $LB_LINUX_FLAVOURS; do
+	if [ -z "$LB_LINUX_FLAVOURS" ] || [ "$LB_LINUX_FLAVOURS" = "none" ]; then
+		continue
+	fi
+	case $FLAVOUR in
+		allwinner|virtual|generic-hwe-*|lowlatency-hwe-*)
+			FLAVOUR="generic"
+			;;
+		oem-*)
+			FLAVOUR="oem"
+			;;
+		image-intel)
+			FLAVOUR="intel"
+			;;
+		intel-iotg*)
+			FLAVOUR="intel-iotg"
+			;;
+	esac
+	KVERS="$( (cd "binary/$INITFS"; ls vmlinu?-* 2>/dev/null || true) | (fgrep -v .efi || true) | sed -n "s/^vmlinu.-\\([^-]*-[^-]*-$FLAVOUR\\)$/\\1/p" )"
+	if [ -z "$KVERS" ]; then
+		if [ -e "binary/$INITFS/vmlinuz" ]; then
+			# already renamed by ubuntu-defaults-image
+			break
+		fi
+		echo "No kernel output for $FLAVOUR!" >&2
+		exit 1
+	fi
+	NUMKVERS="$(set -- $KVERS; echo $#)"
+	if [ "$NUMKVERS" -gt 1 ]; then
+		echo "Cannot handle more than one kernel for $FLAVOUR ($KVERS)!" >&2
+		exit 1
+	fi
+	ln "binary/$INITFS/"vmlinu?-"$KVERS" "$PREFIX.kernel-$FLAVOUR"
+	if [ -e "binary/$INITFS/"vmlinu?-"$KVERS.efi.signed" ]; then
+		ln "binary/$INITFS/"vmlinu?-"$KVERS.efi.signed" "$PREFIX.kernel-$FLAVOUR.efi.signed"
+		chmod 644 "$PREFIX.kernel-$FLAVOUR.efi.signed"
+	fi
+	chmod 644 "$PREFIX.kernel-$FLAVOUR"
+	if [ -e "binary/$INITFS/initrd.img-$KVERS" ]; then
+		ln "binary/$INITFS/initrd.img-$KVERS" "$PREFIX.initrd-$FLAVOUR"
+		chmod 644 "$PREFIX.initrd-$FLAVOUR"
+	fi
+done
+
+NUMFLAVOURS="$(set -- $LB_LINUX_FLAVOURS; echo $#)"
+if [ "$NUMFLAVOURS" = 1 ] && [ "$LB_LINUX_FLAVOURS" != "none" ]; then
+	# only one kernel flavour
+	if [ -f "binary/$INITFS/vmlinuz" ] && ! [ -h "binary/$INITFS/vmlinuz" ]; then
+		ln "binary/$INITFS/vmlinuz" "$PREFIX.kernel"
+		chmod 644 "$PREFIX.kernel"
+	else
+		ln -sf "$PREFIX.kernel-$LB_LINUX_FLAVOURS" "$PREFIX.kernel"
+	fi
+	if [ -f "binary/$INITFS/initrd.lz" ] && ! [ -h "binary/$INITFS/initrd.lz" ]; then
+		ln "binary/$INITFS/initrd.lz" "$PREFIX.initrd"
+		chmod 644 "$PREFIX.initrd"
+	else
+		ln -sf "$PREFIX.initrd-$LB_LINUX_FLAVOURS" "$PREFIX.initrd"
+	fi
+fi
+
+case $SUBARCH in
+	raspi)
+		# copy the kernel and initrd to a predictable directory for
+		# ubuntu-image consumption.  In some cases, like in pi2/3
+		# u-boot, the bootloader needs to contain the kernel and initrd,
+		# so during rootfs build we copy it over to a directory that
+		# ubuntu-image looks for and shoves into the bootloader
+		# partition.
+		UBOOT_BOOT="image/boot/uboot"
+
+		mkdir -p $UBOOT_BOOT
+
+		cp $PREFIX.initrd $UBOOT_BOOT/initrd.img || true
+		cp $PREFIX.kernel $UBOOT_BOOT/vmlinuz || true
+		;;
+esac
+
+case $PROJECT in
+    ubuntu-cpc)
+        config/hooks.d/remove-implicit-artifacts
+esac
