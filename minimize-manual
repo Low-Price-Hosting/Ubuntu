@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# Minimize the number of manually installed packages in the image
+
+# Finds all packages which could be marked as automatically installed and marks
+# them as such
+
+set -e
+
+. config/common
+
+chroot_directory=$1
+
+auto_packages=$(${LIVECD_ROOTFS_ROOT}/auto-markable-pkgs $chroot_directory)
+if [ -n "$auto_packages" ]; then
+	chroot $chroot_directory apt-mark auto $auto_packages
+fi
+[ -z "$(${LIVECD_ROOTFS_ROOT}/auto-markable-pkgs $chroot_directory 2> /dev/null)" ]

@@ -1,0 +1,5 @@
+# This is expected and okay
+livecd-rootfs source: absolute-symbolic-link-target-in-source * [live-build/*]
+
+# The description indicates that it's not required in debhelper >= 13, which we have
+livecd-rootfs source: override_dh_auto_test-does-not-check-DEB_BUILD_OPTIONS [debian/rules:*]

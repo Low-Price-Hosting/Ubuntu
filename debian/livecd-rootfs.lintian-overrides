@@ -1,0 +1,10 @@
+# This is expected and okay
+livecd-rootfs: service-file-is-not-a-file [usr/share/livecd-rootfs/*.service]
+livecd-rootfs: uses-dpkg-database-directly [usr/share/livecd-rootfs/live-build/lb_chroot_layered]
+livecd-rootfs: package-contains-no-arch-dependent-files
+
+# Developer documentation in an already-expected spot
+livecd-rootfs: package-contains-documentation-outside-usr-share-doc [usr/share/livecd-rootfs/live-build/ubuntu-cpc/README.cpc.md]
+
+# This is going to occur quite a bit; we're making a livefs
+livecd-rootfs: repeated-path-segment * [*]
